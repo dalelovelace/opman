@@ -1,0 +1,862 @@
+#!/usr/bin/perl -w
+
+# opman, a masterpiece in Perl!
+# Iterates through a pool of hosts, and (generally) ssh'es 
+# to each of those and performs an action on each.
+
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+# Here we go!
+
+my $version = "1.0.3";
+
+use strict;
+use Config::General qw(ParseConfig);
+use Data::Dumper;
+use Getopt::Long;
+use Pod::Usage;
+use File::Basename;
+use Net::OpenSSH;
+use Math::BigInt;
+use Math::BigInt::GMP;
+use LWP;
+
+sub actionCopy (%){
+  my ($truth) = @_;
+
+  foreach my $file (@{$truth->{'file'}}) {
+    # cat the entire file to copy into our $truth object
+    open FH, $file or die "Can't open $file: $!";
+    $truth->{'stdin'} = do { local $/; <FH> };
+    close FH or die "Can't close $file: $!";
+
+    # If no destination filename is specified
+    # or destination filename = source filename then
+    # tell rlogin that destination filename = source filename
+    my $source = fileparse($file);
+    my $destination = fileparse($truth->{'destination'});
+    if ((! $destination) or ($source eq $destination)) {
+      $truth->{'destinationFileName'} = $source;
+    } else {
+      $truth->{'destinationFileName'} = "";
+    }
+
+    print "Copying $file to $truth->{'host'}:$truth->{'destination'}\n";
+    my($stdout,$stderr) = rlogin($truth);
+
+    if ($stderr) {
+      print STDERR "$truth->{'host'}: Can't write file $truth->{'destination'}/$file\n";
+      print STDERR "$stdout\n";
+      print STDERR "$stderr\n";
+    } else {
+      print "$truth->{'host'}: success\n\n";
+    }
+  }
+  return "Gobbledygook";
+}
+
+sub actionDescribe (%) {
+  my ($truth) = @_;
+
+print "Describing\n";
+
+$Data::Dumper::Indent = 1;
+print Dumper($truth);
+
+  print "Region  : " . $truth->{'region'} . "\n";
+  print "Pool    : " . $truth->{'pool'}->{'friendly'} . "\n";
+  print "Servers : \n";
+  foreach my $key (sort keys %{$truth->{'workingserverlist'}}) {
+    print "  " . $key . "\n";
+  }
+}
+
+sub actionRun (%){
+  my ($truth) = @_;
+
+  print "Executing "  . $truth->{'command'} . " on " . $truth->{'host'} . " \n";
+
+  my($stdout,$stderr) = rlogin($truth);
+
+  if ($stderr) {
+    print STDERR "\n$truth->{'host'} returned an error issuing command \"$truth->{'command'}\"!\n";
+    print STDERR "$stdout\n";
+    print STDERR "$stderr\n";
+  } else {
+    if ($stdout) {
+      print "$truth->{'host'} returns:\n$stdout\n";
+    } else {
+      print "$truth->{'host'} returns:\n";
+    }
+  }
+}
+
+sub actionShowhosts (%){
+  my ($truth) = @_;
+  print "$truth->{'host'} \n";
+}
+
+sub buildFullHostList (%) {
+  my ($pool) = @_;
+  my @fullHostList;
+
+  # Build the full host list by expanding $pool->{'hosts'}
+  if (defined($pool->{'hosts'}->{'list'})) {
+    foreach my $digit (split(/,/, $pool->{'hosts'}->{'list'}->{'digits'})) {
+      if (grep(/-/, $digit)) {
+        (my $start, my $end) = split(/-/, $digit);
+        for (my $count = $start; $count <= $end; $count++) {
+          my $host = $pool->{'hosts'}->{'list'}->{'prefix'} .  sprintf("%0$pool->{'hosts'}->{'list'}->{'significant'}d", $count) .  $pool->{'hosts'}->{'list'}->{'suffix'};
+          push (@fullHostList, $host);
+        }
+      } else {
+         push (@fullHostList, $pool->{'hosts'}->{'list'}->{'prefix'} . sprintf("%0$pool->{'hosts'}->{'list'}->{'significant'}d", $digit) . $pool->{'hosts'}->{'list'}->{'suffix'});
+      }
+    }
+    delete $pool->{'hosts'}->{'list'};
+  }
+
+  if (scalar($pool->{'hosts'})) {
+    if (ref($pool->{'hosts'}) eq "HASH") {
+      foreach my $host (keys %{$pool->{'hosts'}}) {
+        push (@fullHostList, $host);
+      }
+    } else {
+      my $host = $pool->{'hosts'};
+      push (@fullHostList, $host);
+    }
+  }
+
+  return @fullHostList;
+}
+
+sub expandMacros (%) {
+  my ($truth) = @_;
+  my $command = $truth->{'command'};
+
+  $command =~ s/%{HOST}/$truth->{'host'}/g;
+  $command =~ s/%{ME}/$truth->{'me'}/g;
+  $command =~ s/%{USER}/$truth->{'user'}/g;
+
+  return $command;
+}
+
+# SSH to a machine and run a command
+# Yes, the sub name is a joke
+sub rlogin (%) {
+  my ($truth) = @_;
+
+  my $ssh = Net::OpenSSH->new($truth->{'host'}, kill_ssh_on_timeout => 1, timeout => $truth->{'timeout'} );
+  if ( $ssh->error ) {
+    return "Couldn't establish SSH connection to $truth->{'host'}\n", $ssh->error; }
+
+  my ($stdout,$stderr);
+
+  # Let's copy a file!
+  if ($truth->{'command'} eq "copy" ) {
+    if ($truth->{'user'} eq $truth->{'me'}) {
+      if ($truth->{'destinationFileName'}) {
+        $stdout = $ssh->system({stdin_data => $truth->{'stdin'}}, "cat >$truth->{'destination'}/$truth->{'destinationFileName'}") or die "Unable to write file on $truth->{'host'}:\n " . $ssh->error;
+      } else {
+        $stdout = $ssh->system({stdin_data => $truth->{'stdin'}}, "cat >$truth->{'destination'}") or die "Unable to write file on $truth->{'host'}:\n " . $ssh->error;
+      }
+    } else {
+      if ($truth->{'destinationFileName'}) {
+        $stdout = $ssh->system({stdin_data => $truth->{'stdin'}}, "sudo -u $truth->{'user'} /bin/bash -c \"cat >$truth->{'destination'}/$truth->{'destinationFileName'}\"") or die "Unable to write file on $truth->{'host'}:\n" . $ssh->error;
+      } else {
+        $stdout = $ssh->system({stdin_data => $truth->{'stdin'}}, "sudo -u $truth->{'user'} /bin/bash -c \"cat >$truth->{'destination'}\"") or die "Unable to write file on $truth->{'host'}:\n" . $ssh->error;
+      }
+    }
+  } else {
+    # We're not copying a file, so we must be running a command!
+    if ($truth->{'user'} eq $truth->{'me'}) {
+      $stdout =  $ssh->capture({stderr_to_stdout => 1}, $truth->{'command'});
+    } else {
+#      $stdout =  $ssh->capture({stderr_to_stdout => 1, quote_args => 0}, "sudo -u $truth->{'user'} /bin/bash -c \"$truth->{'command'}\"");
+      $stdout =  $ssh->capture({stderr_to_stdout => 1}, "sudo -u $truth->{'user'} /bin/bash -c \"$truth->{'command'}\"");
+    }
+  }
+
+  # Our start/stop scripts are notorious for using "exit 1"
+  # when they succeed... Yeah, that's wrong...
+  if ( $ssh->error =~ /child exited with code 1/ ) {
+    $stderr = "";
+  } else {
+    $stderr = $ssh->error;
+  }
+
+  return $stdout, $stderr;
+}
+
+sub showAllPools(%){
+  my ($pools) = @_;
+
+  foreach my $key (sort keys %{$pools}) {
+    print $key;
+
+    if (length($key) < 24) {
+      for (my $count = 1; $count <= (24 - length($key)) ; $count++) {
+        print " ";
+      }
+    } else {
+      print " ";
+    }
+
+    print " (" . $pools->{$key}->{'friendly'} . ")\n";
+  }
+
+  print "all                      (Opman built-in pool with all hosts in -r|--region)\n";
+  print "\n";
+}
+
+sub showAllRegions(%){
+  my ($config) = @_;
+
+  foreach my $key (sort keys %{$config->{'region'}}) {
+    print $key;
+
+    if (length($key) < 24) {
+      for (my $count = 1; $count <= (24 - length($key)) ; $count++) {
+        print " ";
+      }
+    } else {
+      print " ";
+    }
+
+    print " (" . $config->{'region'}->{$key}->{'friendly'} . " - "  . $config->{'region'}->{$key}->{'location'} . ")\n";
+  }
+
+  print "\n";
+  if ($config->{'defaults'}->{'region'}) {
+    print "The default region if you omit the -r|--region option is: \"" . $config->{'defaults'}->{'region'} . "\"\n";
+  }
+}
+
+sub version($) {
+  my ($version) = @_;
+  die "opman - A Masterpiece in Perl!\nVersion $version\n";
+}
+
+# truth is a hash with everything we'll ever need in it. Let's set it up.
+my $truth;
+
+# Find the right config file
+my $homedir = ($ENV{HOME}||$ENV{LOGDIR}||(getpwnam($<))[7]||"/"); 
+my @config_lines;
+my @useThisArrayToSearchForConfig = ( 
+  "/etc/opman/opman.conf",
+  "/usr/local/etc/opman/opman.conf",
+  $homedir . "/.opman/opman.conf",
+  );
+
+foreach my $isThisTheConfig (@useThisArrayToSearchForConfig) {
+  if (-r $isThisTheConfig) {
+    print "Reading opman config file at $isThisTheConfig\n";
+    push (@config_lines, "<<include " . $isThisTheConfig . ">>");
+  }
+}
+
+# Pull in the myriad of config files with Config::General
+my $configObj = new Config::General(
+  -String          => \@config_lines,
+  -LowerCaseNames  => "true",
+  -IncludeGlob     => "true",
+  -IncludeRelative => "true",
+  -IncludeAgain    => "true",
+  -MergeDuplicateBlocks => "true",
+  -MergeDuplicateOptions => "true",
+);
+
+my %c = $configObj->getall;
+
+my $config = \%c;
+
+# Actions that can be run on all pools
+$truth->{'actions'} = {
+  copy          =>      \&actionCopy,
+  run           =>      \&actionRun,
+  showhosts     =>      \&actionShowhosts,
+  show          =>      \&actionShowhosts,
+#  describe	=>	\&actionDescribe,
+};
+
+# Initialize all the variables used in GetOptions and set defaults
+undef $truth->{'options'}->{'region'};
+$truth->{'options'}->{'action'} = "";
+$truth->{'options'}->{'pool'} = "";
+$truth->{'options'}->{'user'} = "";
+$truth->{'options'}->{'concurrent'} = "";
+$truth->{'options'}->{'timeout'} = "";
+$truth->{'options'}->{'preUser'} = "";
+$truth->{'options'}->{'actionUser'} = "";
+$truth->{'options'}->{'postUser'} = "";
+
+GetOptions (
+    'a|action:s{,}'     =>      \@{$truth->{'options'}->{'actionArray'}},
+    'c|concurrent=i'    =>      \$truth->{'options'}->{'concurrent'},
+    'dryrun'            =>      \$truth->{'options'}->{'dryrun'},
+    'e|exclude=s{,}'    =>      \@{$truth->{'options'}->{'exclude'}},
+    'h|help|?'          =>      \$truth->{'options'}->{'help'},
+    'i|include=s{,}'    =>      \@{$truth->{'options'}->{'include'}},
+    'm|man'             =>      \$truth->{'options'}->{'man'},
+    'p|pool:s'          =>      \$truth->{'options'}->{'pool'},
+    'post:s{,}'         =>      \@{$truth->{'options'}->{'postArray'}},
+    'postuser:s'        =>	\$truth->{'options'}->{'postUser'},
+    'pre:s{,}'          =>      \@{$truth->{'options'}->{'preArray'}},
+    'preuser:s'         =>	\$truth->{'options'}->{'preUser'},
+    'r|region:s'        =>      \$truth->{'options'}->{'region'},
+    'root'              =>      \$truth->{'options'}->{'root'},
+    't|timeout=i'       =>      \$truth->{'options'}->{'timeout'},
+    'test'              =>      \$truth->{'options'}->{'test'},
+    'u|user=s'          =>      \$truth->{'options'}->{'actionUser'},
+    'v|verbose+'        =>      \$truth->{'options'}->{'verbosity'},
+    'version'           =>      \$truth->{'options'}->{'showversion'},
+) or pod2usage(3);
+
+pod2usage(-exitstatus => 0, -verbose => 2) if $truth->{'options'}->{'man'};
+pod2usage(3) if $truth->{'options'}->{'help'};
+version($version) if $truth->{'options'}->{'showversion'};
+
+# Used to verify the pre* action* and post* options
+my $preActionPostHash = {
+  'pre' => 'preArray',
+  'action' => 'actionArray',
+  'post' => 'postArray',
+};
+
+# Determine the user who ran the program
+# If it's root make sure they used the --root switch
+# If root is configured as the default user or the user for an 
+# individual pool we don't warn because that will be set later
+$truth->{'me'} = scalar getpwuid( $< );
+while ((my $option, my $optionArray) = each (%{$preActionPostHash})) {
+  if (($truth->{'me'} eq "root") or ($truth->{'options'}->{$option . 'User'} eq "root") and (!$truth->{'options'}->{'root'})) {
+    print "\nYou are either running opman as root or are ";
+    print "specifying --" . $option . "user root, this\n is HIGHLY discouraged.";
+    print " If you must do this, specify --root as an option\n\n";
+    pod2usage(3);
+  } 
+}
+
+if (defined($truth->{'options'}->{'region'})) {
+  $truth->{'region'} = $truth->{'options'}->{'region'};
+} elsif ($config->{'defaults'}->{'region'}) {
+  $truth->{'region'} = $config->{'defaults'}->{'region'};
+  print "Using default region: " . $truth->{'region'} . "\n";
+}
+
+unless ($truth->{'region'}) {
+  print "\nYou must specify a region with the -r|--region switch.\n";
+  print "Legal choices for -r|--region are:\n\n";
+  showAllRegions($config);
+  pod2usage();
+}
+
+unless ($config->{'region'}->{$truth->{'region'}}) {
+  print "\n-r|--region \"" . $truth->{'region'} . "\"is not a valid region.\n";
+  print "Legal choices for -r|--region are:\n\n";
+  showAllRegions($config);
+  pod2usage();
+}
+
+unless ($truth->{'options'}->{'pool'}) {
+  print "\nYou must specify a pool with the -p|--pool switch.\n";
+  print "\nLegal choices for -p|--pool in -r|--region \"" . $truth->{'region'} . "\" are:\n\n";
+  showAllPools($config->{'region'}->{$truth->{'region'}}->{'pool'});
+  pod2usage();
+}
+
+if ($config->{'region'}->{$truth->{'region'}}->{'pool'}->{$truth->{'options'}->{'pool'}}) {
+  $truth->{'pool'} = $config->{'region'}->{$truth->{'region'}}->{'pool'}->{$truth->{'options'}->{'pool'}};
+} elsif ($truth->{'options'}->{'pool'} ne "all") {
+  print "\n-p|--pool \"" . $truth->{'options'}->{'pool'} . "\" is not a valid pool in -r|--region \"" . $truth->{'region'} . "\".\n";
+  print "\nLegal choices for -p|--pool in -r|--region \"" . $truth->{'region'} . "\" are:\n\n";
+  showAllPools($config->{'region'}->{$truth->{'region'}}->{'pool'});
+  pod2usage();
+}
+
+# If the user did --action/--pre/--post run "command" or
+# -a/--pre/--post copy file destination we store that as an array.
+# The first element of the array should be the actual option
+# and everything else the modifiers. First we shift that actual option
+# into the $truth->{'options'}->(action/pre/post} var, then work out
+# what to do with the rest and check it all for syntax etc.
+while ((my $option, my $optionArray) = each (%{$preActionPostHash})) {
+  $truth->{'options'}->{$option} = shift(@{$truth->{'options'}->{$optionArray}});
+  if ($truth->{'options'}->{$option}) {
+    # option = run
+    if ((defined($truth->{'options'}->{$option})) and ($truth->{'options'}->{$option} eq "run")) {
+      $truth->{'options'}->{$option . 'Command'} =  join(" ",@{$truth->{'options'}->{$optionArray}});
+      unless ($truth->{'options'}->{$option . 'Command'}) {
+        print "\nYou must specify a command for --$option \"run\"!\n";
+        pod2usage("\nEXAMPLE: opman --region REGION --pool  POOL --$option run \"df -h\"\n");
+      }
+    # option = copy
+    } elsif ((defined($truth->{'options'}->{$option})) and ($truth->{'options'}->{$option} eq "copy")) {
+      $truth->{'options'}->{$option . 'Destination'} = pop(@{$truth->{'options'}->{$option . 'Array'}});
+      @{$truth->{'options'}->{$option . 'File'}} = @{$truth->{'options'}->{$option . 'Array'}};
+      $truth->{$option} = \&actionCopy;
+      $truth->{'options'}->{$option . 'Command'} = "copy";
+      unless ($truth->{'options'}->{$option . 'File'} and $truth->{'options'}->{$option . 'Destination'}) {
+        print "\nYou must specify file(s) to copy and target destination for --$option \"copy\"!\n";
+        pod2usage("\nEXAMPLE: opman --region REGION --pool POOL --$option copy ~/file.txt /var/tmp/\n");
+      }
+      if (fileparse($truth->{'options'}->{$option . 'Destination'}) and scalar(@{$truth->{'options'}->{$option . 'File'}}) > 1) {
+        pod2usage("\nCannot copy multiple files to single filename!\n")
+      }
+      foreach my $file (@{$truth->{'options'}->{$option . 'File'}}) {
+        unless (-r $file) {
+          pod2usage("\n--file $file} either does not exist, or is not readable.\n");
+        }
+        if (-s $file > 50000000) {
+          print "\nSize of file to be copied \"$file\" is greater than 500MB.\n";
+          pod2usage("Please copy this file manually!\n");
+        }
+
+        if ((-s $file > 1000000) and ($truth->{'options'}->{'concurrent'} > 1)) {
+          print "\nSize of file to be copied \"$file\" is greater than 1MB\n";
+          print "Reducing -c|--concurrent to 1 !!!\n\n";
+          $truth->{'options'}->{'concurrent'} = 1;
+        }
+      }
+    }
+
+  # Now we have the arrays split up into nice byte sized chunks we can check syntax
+    if ($truth->{'actions'}->{$truth->{'options'}->{$option}}) {
+      $truth->{$option} = \&{$truth->{'actions'}->{$truth->{'options'}->{$option}}};
+    } elsif ($truth->{'pool'}->{'action'}->{$truth->{'options'}->{$option}}) {
+      if (ref($truth->{'pool'}->{'action'}->{$truth->{'options'}->{$option}}) eq "HASH") {
+        $truth->{'options'}->{$option . 'Command'} = $truth->{'pool'}->{'action'}->{$truth->{'options'}->{$option}}->{'command'};
+      } else {
+        $truth->{'options'}->{$option . 'Command'} = $truth->{'pool'}->{'action'}->{$truth->{'options'}->{$option}};
+      }
+      $truth->{$option} = \&actionRun;
+    } else {
+      print "\n---$option \"" . $truth->{'options'}->{$option} . "\" is not a valid action for -p|--pool \"" . $truth->{'options'}->{'pool'} . "\".\n";
+      print "Legal choices for --$option in -r|--region \"" . $truth->{'region'} . "\" -p|--pool \"" . $truth->{'options'}->{'pool'} . "\" are:\n\n";
+      foreach my $key (sort keys %{$truth->{'actions'}}, sort keys %{$config->{'region'}->{$truth->{'region'}}->{'pool'}->{$truth->{'options'}->{'pool'}}->{'action'}}) {
+        print $key . "\n";
+      }
+      print "\n";
+      pod2usage();
+    }
+    # Determine which user to execute pre/action/post as
+    unless ($truth->{'options'}->{$option . 'User'}) {
+      if ((ref($truth->{'pool'}->{'action'}->{$truth->{'options'}->{$option}}) eq "HASH") and (defined($truth->{'pool'}->{'action'}->{$truth->{'options'}->{$option}}->{'user'}))) {
+        $truth->{'options'}->{$option . 'User'} = $truth->{'pool'}->{'action'}->{$truth->{'options'}->{$option}}->{'user'};
+        print "Using default user for --$option defined in action \"" . $truth->{'options'}->{$option} . "\": " . $truth->{'options'}->{$option . 'User'} . "\n";
+      } elsif ($truth->{'pool'}->{'user'}) {
+        $truth->{'options'}->{$option . 'User'} = $truth->{'pool'}->{'user'};
+        print "Using default user for --$option \"" . $truth->{'options'}->{$option} . "\" defined in pool \"" . $truth->{'options'}->{'pool'} . "\": " . $truth->{'options'}->{$option . 'User'} . "\n";
+      } elsif ($config->{'defaults'}->{'user'}) {
+        $truth->{'options'}->{$option . 'User'} = $config->{'defaults'}->{'user'};
+        print "Using default user for --$option: " . $truth->{'options'}->{$option . 'User'} . "\n";
+      } elsif ($truth->{'options'}->{'actionUser'}) {
+        $truth->{'options'}->{$option . 'User'} = $truth->{'options'}->{'actionUser'};
+      } else {
+        $truth->{'options'}->{$option . 'User'} = $truth->{'me'};
+      }
+    }
+  }
+}
+
+unless ($truth->{'options'}->{'action'}) {
+  print "\nYou must specify an action with the -a|--action switch.\n";
+  print "Legal choices for -a|--action in -r|--region \"" . $truth->{'region'} . "\" -p|--pool \"" . $truth->{'options'}->{'pool'} . "\" are:\n\n";
+  foreach my $key (sort keys %{$truth->{'actions'}}, sort keys %{$config->{'region'}->{$truth->{'region'}}->{'pool'}->{$truth->{'options'}->{'pool'}}->{'action'}}) {
+    print $key . "\n";
+  }
+  print "\n";
+  pod2usage();
+}
+
+# We have a region, pool, and action defined legally, this is going to happen!
+
+# Find out if we have a "maxconcurrent =" option in action, pool, or <default>
+$truth->{'maxconcurrent'}="";
+while ((my $option, my $optionArray) = each (%{$preActionPostHash})) {
+  if ((defined($truth->{'options'}->{$option})) and (ref($truth->{'pool'}->{'action'}->{$truth->{'options'}->{$option}}) eq "HASH")) {
+    if (($truth->{'pool'}->{'action'}->{$truth->{'options'}->{$option}}->{'maxconcurrent'}) and ((! $truth->{'maxconcurrent'}) or ($truth->{'pool'}->{'action'}->{$truth->{'options'}->{$option}}->{'maxconcurrent'} lt $truth->{'maxconcurrent'}))) {
+      $truth->{'maxconcurrent'} = $truth->{'pool'}->{'action'}->{$truth->{'options'}->{$option}}->{'maxconcurrent'};
+      $truth->{'concurrentMessage'} = "maximum concurrent processes allowed by --$option " . $truth->{'options'}->{$option} .  ": " . $truth->{'maxconcurrent'};
+    }
+  }
+}
+
+# Determine number of concurrent processes to run
+# If an option was specified on the command line use that value
+# If not, check to see if the action has a default and use that (not --pre/--post)
+# If not, check to see if the pool has a default and use that
+# If not, check to see if we have an opman <default> and use that
+if ($truth->{'options'}->{'concurrent'}) {
+  if (($truth->{'maxconcurrent'}) and ($truth->{'options'}->{'concurrent'} gt $truth->{'maxconcurrent'})) {
+    print "WARN: Option -c|--concurrent " . $truth->{'options'}->{'concurrent'} . " is greater than " . $truth->{'concurrentMessage'} . "\n";
+    print "Setting -c|--concurrent " . $truth->{'maxconcurrent'} . "\n";
+    $truth->{'concurrent'} = $truth->{'maxconcurrent'};
+  } else { 
+    $truth->{'concurrent'} = $truth->{'options'}->{'concurrent'};
+  }
+} elsif ((ref($truth->{'pool'}->{'action'}->{$truth->{'options'}->{'action'}}) eq "HASH") and (defined($truth->{'pool'}->{'action'}->{$truth->{'options'}->{'action'}}->{'concurrent'}))) {
+  if (($truth->{'maxconcurrent'}) and ($truth->{'pool'}->{'action'}->{$truth->{'options'}->{'action'}}->{'concurrent'} gt $truth->{'maxconcurrent'})) {
+    $truth->{'concurrent'} = $truth->{'maxconcurrent'};
+    print "Using " . $truth->{'concurrentMessage'} . "\n";
+  } else {
+    $truth->{'concurrent'} = $truth->{'pool'}->{'action'}->{$truth->{'options'}->{'action'}}->{'concurrent'};
+  print "Using default concurrency defined in action \"" . $truth->{'options'}->{'action'} . "\": " . $truth->{'concurrent'} . "\n";
+  }
+} elsif ($truth->{'pool'}->{'concurrent'}) {
+  if (($truth->{'maxconcurrent'}) and ($truth->{'pool'}->{'concurrent'} gt $truth->{'maxconcurrent'})) {
+    $truth->{'concurrent'} = $truth->{'maxconcurrent'};
+    print "Using " . $truth->{'concurrentMessage'} . "\n";
+  } else {
+    $truth->{'concurrent'} = $truth->{'pool'}->{'concurrent'};
+    print "Using default concurrency defined in pool \"" . $truth->{'options'}->{'pool'} . "\": " . $truth->{'concurrent'} . "\n";
+  }
+} elsif ($config->{'defaults'}->{'concurrent'}) {
+  if (($truth->{'maxconcurrent'}) and ($config->{'defaults'}->{'concurrent'} gt $truth->{'maxconcurrent'})) {
+    $truth->{'concurrent'} = $truth->{'maxconcurrent'};
+    print "Using " . $truth->{'concurrentMessage'} . "\n";
+  } else {
+    $truth->{'concurrent'} = $config->{'defaults'}->{'concurrent'};
+    print "Using default concurrency: " . $truth->{'concurrent'} . "\n";
+  }
+} else {
+  $truth->{'concurrent'} = 1;
+}
+
+if ($truth->{'options'}->{'timeout'}) {
+  $truth->{'timeout'} = $truth->{'options'}->{'timeout'};
+} elsif ((ref($truth->{'pool'}->{'action'}->{$truth->{'options'}->{'action'}}) eq "HASH") and (defined($truth->{'pool'}->{'action'}->{$truth->{'options'}->{'action'}}->{'timeout'}))) {
+  $truth->{'timeout'} = $truth->{'pool'}->{'action'}->{$truth->{'options'}->{'action'}}->{'timeout'};
+  print "Using default timeout defined in action \"" . $truth->{'options'}->{'action'} . "\": " . $truth->{'timeout'} . "\n";
+} elsif ($truth->{'pool'}->{'timeout'}) {
+  $truth->{'timeout'} = $truth->{'pool'}->{'timeout'};
+  print "Using default timeout defined in pool \"" . $truth->{'options'}->{'pool'} . "\": " . $truth->{'timeout'} . "\n";
+} elsif ($config->{'defaults'}->{'timeout'}) {
+  $truth->{'timeout'} = $config->{'defaults'}->{'timeout'};
+  print "Using default timeout: " . $truth->{'timeout'} . "\n";
+}
+
+# Determine where we want to execute -a|--action
+if ((ref($truth->{'pool'}->{'action'}->{$truth->{'options'}->{'action'}}) eq "HASH") and (defined($truth->{'pool'}->{'action'}->{$truth->{'options'}->{'action'}}->{'target'}))) {
+  $truth->{'target'} = $truth->{'pool'}->{'action'}->{$truth->{'options'}->{'action'}}->{'target'};
+} elsif ($truth->{'pool'}->{'target'}) {
+  $truth->{'target'} = $truth->{'pool'}->{'timeout'};
+} elsif ($config->{'defaults'}->{'target'}) {
+  $truth->{'target'} = $config->{'defaults'}->{'target'};
+}
+
+# Build the full host list by expanding $truth->{'pool'}-{'hosts'}
+# If the pool is the Opman builtin pool "all", do it for all pools in the region!
+if (($truth->{'options'}->{'pool'} eq "all") and
+   (! $config->{'region'}->{$truth->{'region'}}->{'pool'}->{'all'})) {
+
+  foreach my $key (sort keys %{$config->{'region'}->{$truth->{'region'}}->{'pool'}}) {
+    my @hostlist = buildFullHostList($config->{'region'}->{$truth->{'region'}}->{'pool'}->{$key});
+    foreach my $host(@hostlist) {
+      unless (grep /$host/, @{$truth->{'fullserverlist'}}) {
+        push (@{$truth->{'fullserverlist'}}, $host);
+      }
+    }
+  }
+} else {
+  @{$truth->{'fullserverlist'}} = buildFullHostList($truth->{'pool'});
+}
+
+# Build the working host list by -i|--include'ing and -e|--exclude'ing
+if (scalar(@{$truth->{'options'}->{'include'}})>0) {
+  foreach my $key (@{$truth->{'options'}->{'include'}}) {
+    my @list = grep(/${key}/, @{$truth->{'fullserverlist'}});
+    if (@list) {
+      foreach my $host (@list) {
+        unless (grep /$host/, @{$truth->{'workingserverlist'}}) {
+          push (@{$truth->{'workingserverlist'}}, $host);
+        }
+      }
+    } else {
+      pod2usage("\n\"$key\" used in option -i|--include does not match any valid host in the " . $truth->{'options'}->{'pool'} . " pool!\n\nTry \"opman -r " . $truth->{'region'} . " -p " . $truth->{'options'}->{'pool'} . " -a showhosts\" for the list of hosts in \"" . $truth->{'options'}->{'pool'} . "\".\n");
+    }
+  }
+} else {
+  @{$truth->{'workingserverlist'}} = @{$truth->{'fullserverlist'}};
+}
+
+if (scalar(@{$truth->{'options'}->{'exclude'}})>0) {
+  foreach my $key (@{$truth->{'options'}->{'exclude'}}) {
+    if (grep(/$key/, @{$truth->{'workingserverlist'}})) {
+      @{$truth->{'workingserverlist'}} = grep(! /$key/, @{$truth->{'workingserverlist'}});
+    } else {
+      pod2usage("\n\"$key\" used in option -e|--exclude does not match any valid host in the " . $truth->{'options'}->{'pool'} . " pool!\n\nTry \"opman -r " . $truth->{'region'} . " -p " . $truth->{'options'}->{'pool'} . " -a showhosts\" for the list of hosts in \"" . $truth->{'options'}->{'pool'} . "\".\n");
+    }
+  } 
+}
+
+print "\n";
+
+# If any of pre/action/post have prompt=STRING give the user a moment to think
+while ((my $option, my $optionArray) = each (%{$preActionPostHash})) {
+  if ((defined($truth->{'options'}->{$option})) and (ref($truth->{'pool'}->{'action'}->{$truth->{'options'}->{$option}}) eq "HASH") and ($truth->{'pool'}->{'action'}->{$truth->{'options'}->{$option}}->{'prompt'})) {
+    print "--$option " . $truth->{'options'}->{$option} . " has \"prompt = " . $truth->{'pool'}->{'action'}->{$truth->{'options'}->{$option}}->{'prompt'} . "\".\n";
+    print "Enter \"" . $truth->{'pool'}->{'action'}->{$truth->{'options'}->{$option}}->{'prompt'} . "\" to continue - anything else exits \n";
+    print "[opman] # ";
+    chomp(my $answer = <STDIN>);
+    unless ($answer eq $truth->{'pool'}->{'action'}->{$truth->{'options'}->{$option}}->{'prompt'}) {
+      print "You entered \"$answer\" \n";
+      print "Goodbye!\n";
+      exit 0;
+    }
+    last;
+  }
+}
+
+
+if ($truth->{'options'}->{'action'} eq "describe") {
+  describe($truth);
+  exit 0;
+} elsif ($truth->{'options'}->{'test'}) {
+  $Data::Dumper::Indent = 1;
+  print "Dumper output for \$config object\n";
+  print "---------------------------------\n";
+  print Dumper($config);
+  print "\nDumper output for \$truth object\n";
+  print "--------------------------------\n";
+  print Dumper($truth);
+} else {
+  my $c = 0;
+
+  foreach my $host (@{$truth->{'workingserverlist'}}) {
+    $truth->{'host'} = $host;
+
+    if ($truth->{'options'}->{'dryrun'}) {
+      print "DRYRUN: Would have executed action \"";
+      print "$truth->{'options'}->{'action'}\" on $truth->{'host'}\n";
+      next;
+    }
+
+    wait unless ++ $c <= $truth->{'concurrent'};
+    die "Fork failed: $!\n" unless defined (my $pid = fork);
+
+    unless($pid) {
+      foreach my $step (qw(pre action post)) {
+        if ((defined($truth->{'options'}->{$step})) 
+            and ($truth->{'options'}->{$step})) {
+          if ($truth->{'options'}->{$step . 'User'}) {
+            $truth->{'user'} = $truth->{'options'}->{$step . 'User'};
+          }
+
+          if ($truth->{'options'}->{$step . 'Command'}) {
+            $truth->{'command'} = $truth->{'options'}->{$step . 'Command'};
+            $truth->{'command'} = expandMacros($truth);
+          }
+
+          if ($truth->{'options'}->{$step . 'File'}) {
+            $truth->{'file'} = $truth->{'options'}->{$step . "File"};
+          }
+
+          if ($truth->{'options'}->{$step . 'Destination'}) {
+            $truth->{'destination'} = $truth->{'options'}->{$step . "Destination"};
+          }
+
+          if ((ref($truth->{'pool'}->{'action'}->{$step}) eq "HASH") 
+              and (defined($truth->{'pool'}->{'action'}->{$step}->{'target'}))) {
+            $truth->{'host'} = $truth->{'pool'}->{'action'}->{$step}->{'target'};
+          }
+
+          $truth->{$step}->($truth);
+        }
+      }
+      exit;
+    }
+  }
+  1 until -1 == wait;
+}
+
+exit 0;
+
+__END__
+
+=head1 opman
+
+=head1 SYNOPSIS
+
+ opman -r|--region REGION -p|--pool POOL -a|--action ACTION [options]
+ opman --man
+ opman --help
+ opman --version
+
+=head1 DESCRIPTION
+
+B<Iterates through a pool of hosts, ssh'es to each of those and
+performs an action on each. This is, obviously, much more useful
+if you have setup ssh keys to each of these hosts ahead of time
+to prevent having to type your password for each!>B
+
+=head1 OPTIONS
+
+=over
+
+=item B<-help>
+
+Print a help message then exit
+
+=item B<-man>
+
+Displays the full manual page
+
+=item B<-r|--region> REGION (required - default can be set in opman.conf)
+
+The region, i.e. Data Center, that the pool resides in. "opman -r" will display all legal choices for -r|--region.
+
+=item B<-p|--pool POOL> (required)
+
+The pool of hosts to iterate over. Pools are defined in the /etc/opman/opman.conf file. Legal choices for -p|--pool will be shown if the -p|--pool switch is omitted or empty, i.e. "opman -r REGION -p".
+
+Opman has a builtin pool "all" which will include all hosts in all pools in a region. The only actions available on pool "all" are the opman builtin actions. Defaults will be drawn from the region definition, not from any of the individual pools.
+
+The "all" pool may be overwritten in any or all regions in the Opman config file.
+
+=item B<-a|--action> ACTION (required)
+
+The action you wish to be performed on each host in -p|--pool. Opman has builtin actions, and user defined actions. All actions will be shown if the -a|--action switch is omitted or empty, i.e. "opman -r REGION -p POOL -a". 
+
+=item B<OPMAN BUILTIN ACTIONS>
+
+=item B<copy> FILE DESTINATION
+
+Copies a file or files from the local host to hosts in -p|--pool. 
+
+FILE specifies the file located on your local machine to be copied to the hosts in -p|--pool. FILE may be a wildcard, like /var/tmp/context.*, or a space delimited list of files like file1 file2 file3, or both like file1 file2 /var/tmp/context.*.
+
+DESTINATION specifies the remote location to copy the file(s). This may include a filename for the destination, unless FILE is a list.
+
+The file(s) will be written on the remote machine as the user specified by -u|--user.
+
+Examples:
+
+ * opman -p POOL -a copy /tmp/startup.conf /var/tomcat/globalconf/
+ * opman -p POOL -a copy /tmp/* /tmp/
+ * opman -p POOL -a copy /tmp/file1 /home/dlovelace/file2 /var/tmp/
+ * opman -p POOL -a copy /tmp/context.xml /var/tmp/context.xml.NEW
+
+NOTES ON COPY ACTION:
+
+ * If FILE is larger than 1MB -c|--concurrent will be reduced to 1
+ * If FILE is larger than 500MB opman will refuse to copy it
+
+=item B<run "COMMAND">
+
+runs "COMMAND" on each host in -p|--pool. 
+ 
+ Examples:
+ * opman --region REGION --pool POOL --action run "df -h"
+ * Generally the command needs to be quoted
+ * Escape special characters like \$
+
+=item B<showhosts>
+
+Prints the names of the hosts in -p|--pool
+
+ * Honors the -i|--include and -e|--exclude options
+ * Useful as a "dry run" to determine if the list of hosts you will 
+   eventually perform an action on will be correct
+
+=item B<--pre> ACTION
+
+Specifies an action to perform on each host in -p|--pool. Any legal choice for -a|--action is also a legal choice for --pre. The action specified for -pre will happen prior to performing the action specified by -a|--action.
+
+=item B<--post> ACTION
+
+Similar to the --pre option except that the --post action is performed after -a|--action. All legal choices for -a|--action are also legal choices for --post.
+
+=item B<-u|--user> USER (default can be set in opman.conf)
+
+Specifies the user to run the remote command as. opman will always ssh from the local machine to the remote machine as the user who ran opman. Specifying any user other than yourself causes opman to perform a "sudo -u USER /bin/bash -c COMMAND" on the remote machine, so your user must have permission to sudo to this user on the remote machine.
+
+=item B<-c|--concurrent INTEGER> (default "1", also can be set in opman.conf)
+
+The number of hosts to perform --action on simultaneously. If INTEGER is greater than or equal to the number of all hosts in --pool, opman will execute --action on all hosts in the pool at once. If INTEGER is smaller than the number of hosts in the pool, opman will spawn INTEGER number of copies of itself and perform --action on each. When any of the copies opman has spawned returns from performing --action, opman will move to the next host in --pool and perform --action. This means that hosts will rarely return in the order they were called if INTEGER is greater than 1.
+
+=item B<-i|--include> WORDS
+
+Normally opman performs -a|--action on all hosts in -p|--pool. Specifying -i|--include will allow you perform -a|--action only on the hosts specified. This is a space (" ") delimited list, which can be anything to uniquely identify which hosts are to be included. This can be a regular expression. Anything specified in this list will be grepped against the full host list in -p|--pool. The showhosts action is very helpful in determining if the list of hosts will be correct as it honors the -i|--include and -e|--exclude options.
+
+For example, if your host list in -p|--pool was:
+
+ pr01.x.com 
+ pr02.x.com 
+ pr03.x.com 
+ sos03.x.com 
+ yas.ad.com 
+
+ "-i pr" would include pr01.x.com, pr02.x.com, and pr03.x.com 
+ "-i ad.com" would include yas.ad.com
+ "-i 3" would include pr03.x.com and sos03.x.com.
+
+The "seq" command can be very helpful:
+
+"-b `seq -f "pr%02g" 2 3`"  would include pr02.x.com and pr03.x.com 
+
+man seq for more information on seq.
+
+=item B<-e|--exclude> WORDS
+
+Similar to the -i|--include option, except in reverse. Specifying -e|--exclude will allow you to exclude any hosts specified. Follows the same rules as -i|--include. Note that the -i|--include and the -e|--exclude options may both be used on the same command line. The -i|--include option is evaluated first, then -e|--exclude.
+
+=item B<--root>
+
+If you must run opman as root or specify --user root, you must also use the --root option to let opman know you really want to do this.
+
+=item B<-t|--timeout> (default can be set in opman.conf)
+
+Timeout value for -a|--action in seconds .
+
+=item B<--version>
+
+Shows the version. Yes, it's rocket science.
+
+=back
+
+=head1 EXAMPLES
+
+Copy local file /var/tmp/gen3.properties to /var/tomcat/globalconf/ on all hosts in the chameleon pool:
+
+$ opman --pool chameleon --action copy /var/tmp/gen3.properties /var/tomcat/globalconf/
+
+Run the command "uptime" on all hosts in the xml pool 5 at a time
+
+$ opman --pool xml --action run "uptime" --concurrent 5
+
+Find out what hosts are in the cp pool
+
+$ opman --pool cp --action showhosts
+
+Run the user defined "hostname" action on all hosts in the xml pool simultaneously
+
+$ opman --pool xml --action hostname --concurrent 9999
+
+Run the user defined action "deploy" to the first 5 hosts in the chameleon pool, all simultaneously
+
+$ opman --pool chameleon --action deploy --include 01 02 03 04 05 --concurrent 99 
+
+Run the user defined action "restart" on all hosts in the mc pool
+
+$ opman --pool mc --action restart 
+
+
+=head1 AUTHOR
+
+Dale Lovelace <dlovelace@expedia.com>
+
+=cut
+
